@@ -18,7 +18,21 @@ def get_odds(sport, regions, markets):
     return response.json()
 
 
-def get_sports(): 
+def get_scores(sport, days_from=3, event_ids=None):
+    url = f"{BASE_URL}/sports/{sport}/scores"
+    params = {
+        "apiKey": API_KEY,
+        "daysFrom": days_from,
+    }
+    if event_ids:
+        params["eventIds"] = ",".join(event_ids)
+    response = requests.get(url, params=params)
+    print(f"Scores {sport}: kostnad {response.headers.get('x-requests-last')}, "
+          f"kvar {response.headers.get('x-requests-remaining')}")
+    return response.json()
+
+
+def get_sports():
     url = f"{BASE_URL}/sports"
     params = {
         "apiKey": API_KEY
