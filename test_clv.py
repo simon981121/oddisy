@@ -1,9 +1,13 @@
+import importlib
+import io
 import os
 import sqlite3
+import sys
 import tempfile
 import unittest
-from contextlib import closing
+from contextlib import closing, redirect_stdout
 from datetime import datetime, timezone
+from unittest import mock
 
 import clv
 import logger
@@ -229,6 +233,196 @@ class TestMigration(unittest.TestCase):
         with closing(sqlite3.connect(logger.DB_FILE)) as conn:
             with self.assertRaises(sqlite3.IntegrityError):
                 conn.execute("UPDATE bets SET clv_status = 'klar'")
+
+    def test_run_migrates_given_db(self):
+        other = os.path.join(self.tmp.name, "annan.db")
+        logger.DB_FILE = other                            # run ska använda sin egen sökväg
+        old = os.path.join(self.tmp.name, "old_bets.db")
+        with redirect_stdout(io.StringIO()):
+            clv.run(old, fetch=lambda *a: self.fail("inget anrop väntat"), now=NOW)
+        with closing(sqlite3.connect(old)) as conn:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(bets)")]
+        self.assertIn("clv_status", cols)
+        self.assertFalse(os.path.exists(other))
+
+
+def event(*markets):
+    """Påhittat svar från event-odds-endpointen med bara Pinnacle."""
+    return {"id": "x", "bookmakers": [{"key": "pinnacle", "title": "Pinnacle", "markets": list(markets)}]}
+
+
+class TestRun(DbTestCase):
+    def setUp(self):
+        super().setUp()
+        self.calls = []
+
+    def fake_fetch(self, responses):
+        """responses: {match_id: data}. Kostnad = antal begärda marknader, som i dokumentationen."""
+        def fetch(sport_key, event_id, market_key):
+            self.calls.append((sport_key, event_id, market_key))
+            self.remaining = getattr(self, "remaining", 500) - len(market_key.split(","))
+            return responses[event_id], str(len(market_key.split(","))), str(self.remaining)
+        return fetch
+
+    def run_clv(self, responses):
+        with redirect_stdout(io.StringIO()) as out:
+            summary = clv.run(self.db, self.fake_fetch(responses), NOW)
+        return summary, out.getvalue()
+
+    def test_one_call_per_match_and_costs_printed(self):
+        self.add("m1", "2026-10-07T18:05:00Z")
+        self.add("m1", "2026-10-07T18:05:00Z", market_key="totals", outcome="Over", point=2.5)
+        self.add("m1", "2026-10-07T18:05:00Z", outcome="Borta")
+        self.add("m2", "2026-10-07T18:10:00Z")
+        market = event(H2H, totals((2.5, 1.95, 1.95)))
+        _, out = self.run_clv({"m1": market, "m2": event(H2H)})
+        self.assertEqual(self.calls, [("soccer_sweden_allsvenskan", "m1", "h2h,totals"),
+                                      ("soccer_sweden_allsvenskan", "m2", "h2h")])
+        self.assertIn("4 bets startar inom 15 min", out)
+        self.assertIn("beräknad kostnad högst 3 krediter", out)
+        self.assertIn("kostnad 2, kvar 498", out)
+        self.assertIn("kostnad 1, kvar 497", out)
+
+    def test_statuses_saved_and_summary(self):
+        ok = self.add("m1", "2026-10-07T18:05:00Z")
+        changed = self.add("m1", "2026-10-07T18:05:00Z", market_key="totals", outcome="Over", point=2.5)
+        gone = self.add("m2", "2026-10-07T18:05:00Z", outcome="Draw")
+        two_way = {"key": "h2h", "outcomes": H2H["outcomes"][:2]}
+        summary, out = self.run_clv({"m1": event(H2H, totals((3.0, 1.95, 1.95))),
+                                     "m2": event(two_way)})
+        expected_fair = calculate_fair_odds(H2H["outcomes"])[0]
+        fair, value, status = self.row(ok)
+        self.assertEqual(status, "ok")
+        self.assertAlmostEqual(fair, expected_fair)
+        self.assertAlmostEqual(value, 2.1 / expected_fair - 1)
+        self.assertEqual(self.row(changed), (None, None, "line_changed"))
+        self.assertEqual(self.row(gone), (None, None, "missing"))
+        self.assertEqual((summary["ok"], summary["line_changed"], summary["missing"]),
+                         ([ok], [changed], [gone]))
+        self.assertAlmostEqual(summary["average_clv"], value)
+        self.assertIn("Sammanfattning: 1 ok, 1 line_changed, 1 missing", out)
+        self.assertIn(f"Snitt-CLV (ok): {value * 100:+.2f}%", out)
+
+    def test_api_error_left_null_without_crash(self):
+        bet_id = self.add("m1", "2026-10-07T18:05:00Z")
+        totals_id = self.add("m1", "2026-10-07T18:05:00Z", market_key="totals", outcome="Over", point=2.5)
+        quota = ({"message": "Usage quota has been reached"}, None, None)
+        with redirect_stdout(io.StringIO()) as out:
+            summary = clv.run(self.db, lambda *a: quota, NOW)
+        self.assertEqual(self.row(bet_id), (None, None, None))
+        self.assertEqual(self.row(totals_id), (None, None, None))
+        self.assertEqual(summary["retry"], [bet_id, totals_id])
+        self.assertEqual(summary["missing"], [])
+        self.assertIsNone(summary["average_clv"])
+        self.assertIn("Usage quota has been reached", out.getvalue())
+        self.assertIn("Sammanfattning: 0 ok, 0 line_changed, 0 missing", out.getvalue())
+        self.assertIn("API-fel: 2 bets hoppade över, försöker igen nästa körning", out.getvalue())
+
+    def test_network_and_http_errors_left_null(self):
+        for data in ({"message": "nätverksfel (ConnectionError)"},
+                     {"message": "ogiltigt svar (HTTP 502)"},
+                     {"message": "Event not found"},
+                     None, "trasigt"):
+            with self.subTest(data=data):
+                bet_id = self.add(f"m-{data!r}", "2026-10-07T18:05:00Z")
+                with redirect_stdout(io.StringIO()):
+                    summary = clv.run(self.db, lambda *a: (data, None, None), NOW)
+                self.assertEqual(self.row(bet_id), (None, None, None))
+                self.assertIn(bet_id, summary["retry"])
+
+    def test_retried_next_run_after_api_error(self):
+        bet_id = self.add("m1", "2026-10-07T18:05:00Z")
+        with redirect_stdout(io.StringIO()):
+            clv.run(self.db, lambda *a: ({"message": "nätverksfel (Timeout)"}, None, None), NOW)
+        self.assertIsNone(self.row(bet_id)[2])
+        summary, _ = self.run_clv({"m1": event(H2H)})
+        self.assertEqual(self.calls, [("soccer_sweden_allsvenskan", "m1", "h2h")])
+        self.assertEqual(self.row(bet_id)[2], "ok")
+        self.assertEqual(summary["retry"], [])
+
+    def test_api_error_for_one_match_does_not_stop_others(self):
+        failed = self.add("m1", "2026-10-07T18:05:00Z")
+        ok = self.add("m2", "2026-10-07T18:05:00Z")
+        responses = {"m1": {"message": "Usage quota has been reached"}, "m2": event(H2H)}
+        summary, out = self.run_clv(responses)
+        self.assertEqual(self.row(failed), (None, None, None))
+        self.assertEqual(self.row(ok)[2], "ok")
+        self.assertEqual((summary["ok"], summary["retry"]), ([ok], [failed]))
+        self.assertIn("API-fel: 1 bets hoppade över", out)
+
+    def test_no_pinnacle_in_response_is_missing(self):
+        bet_id = self.add("m1", "2026-10-07T18:05:00Z")
+        summary, out = self.run_clv({"m1": {"id": "m1", "bookmakers": []}})
+        self.assertEqual(self.row(bet_id), (None, None, "missing"))
+        self.assertEqual(summary["retry"], [])
+        self.assertNotIn("Varning", out)
+        self.assertNotIn("API-fel", out)
+
+    def test_nothing_in_window_no_calls(self):
+        self.add("m1", "2026-10-07T19:00:00Z")
+        summary, out = self.run_clv({})
+        self.assertEqual(self.calls, [])
+        self.assertIn("beräknad kostnad högst 0 krediter", out)
+        self.assertIn("Snitt-CLV (ok): –", out)
+
+    def test_handled_bets_not_fetched_again(self):
+        bet_id = self.add("m1", "2026-10-07T18:05:00Z")
+        clv.save_clv(self.conn, bet_id, 2.0, 0.05, "ok")
+        self.run_clv({})
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.row(bet_id), (2.0, 0.05, "ok"))
+
+    def test_missing_db_not_created(self):
+        missing = os.path.join(self.tmp.name, "finns_inte.db")
+        with self.assertRaises(FileNotFoundError):
+            clv.run(missing, self.fake_fetch({}), NOW)
+        self.assertFalse(os.path.exists(missing))
+
+
+class TestGetPinnacleOdds(unittest.TestCase):
+    """api.py importeras med load_dotenv avstängd, så .env aldrig läses. requests.get är mockad."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.modules.pop("api", None)
+        with mock.patch("dotenv.load_dotenv"):
+            cls.api = importlib.import_module("api")
+
+    @classmethod
+    def tearDownClass(cls):
+        sys.modules.pop("api", None)
+
+    def setUp(self):
+        patcher = mock.patch.object(self.api, "API_KEY", "test-nyckel")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_event_endpoint_pinnacle_only(self):
+        response = mock.Mock(headers={"x-requests-last": "2", "x-requests-remaining": "498"})
+        response.json.return_value = event(H2H)
+        with mock.patch.object(self.api.requests, "get", return_value=response) as get:
+            data, cost, remaining = self.api.get_pinnacle_odds("soccer_x", "ev1", "h2h,totals")
+        url = get.call_args.args[0]
+        params = get.call_args.kwargs["params"]
+        self.assertTrue(url.endswith("/v4/sports/soccer_x/events/ev1/odds"))
+        self.assertEqual(params, {"apiKey": "test-nyckel", "bookmakers": "pinnacle",
+                                  "markets": "h2h,totals"})
+        self.assertEqual((data, cost, remaining), (event(H2H), "2", "498"))
+
+    def test_network_error_hides_key(self):
+        error = self.api.requests.ConnectionError("https://...?apiKey=test-nyckel")
+        with mock.patch.object(self.api.requests, "get", side_effect=error):
+            data, cost, remaining = self.api.get_pinnacle_odds("soccer_x", "ev1", "h2h")
+        self.assertNotIn("test-nyckel", data["message"])
+        self.assertIn("ConnectionError", data["message"])
+        self.assertEqual((cost, remaining), (None, None))
+
+    def test_non_json_response(self):
+        response = mock.Mock(status_code=502, headers={})
+        response.json.side_effect = ValueError("not json")
+        with mock.patch.object(self.api.requests, "get", return_value=response):
+            data, _, _ = self.api.get_pinnacle_odds("soccer_x", "ev1", "h2h")
+        self.assertIn("502", data["message"])
 
 
 if __name__ == "__main__":

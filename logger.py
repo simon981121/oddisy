@@ -5,9 +5,9 @@ from datetime import datetime, timezone
 DB_FILE = "bets.db"
 
 
-def init_db():
+def init_db(db_file=None):
     """Skapar tabellen bets och dubblettindexet om de saknas."""
-    with closing(sqlite3.connect(DB_FILE)) as conn, conn:
+    with closing(sqlite3.connect(db_file or DB_FILE)) as conn, conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS bets (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
