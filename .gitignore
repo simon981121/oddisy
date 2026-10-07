@@ -5,3 +5,4 @@ __pycache__
 seen_bets.json
 bets.xlsx
 bets.db
+bets_export.xlsx
