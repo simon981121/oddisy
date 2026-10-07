@@ -12,6 +12,8 @@ REGIONS = "eu"
 MARKETS = "h2h,totals"
 MY_BOOKMAKERS = ["unibet_se"]
 MAX_DAYS_AHEAD = 3
+MAX_EDGE = 0.15
+MAX_ODDS_AGE = timedelta(minutes=3)
 
 init_excel()
 seen = load_seen()
@@ -28,6 +30,8 @@ for sport in sports:
                 continue
             commence_time = datetime.fromisoformat(match["commence_time"].replace("Z", "+00:00"))  # gör om sträng till datumobjekt
             now = datetime.now(timezone.utc)                             # "nu" i UTC-tid
+            if commence_time <= now:                                     # bara förmatch
+                continue
             if commence_time > now + timedelta(days=MAX_DAYS_AHEAD):                
                 continue
 
@@ -36,6 +40,11 @@ for sport in sports:
             # Steg 1 & 2: Hitta Pinnacle, hoppa över om den saknas
             pinnacle = find_pinnacle(match["bookmakers"])
             if pinnacle is None:
+                continue
+
+            # Gamla Pinnacle-odds ger felaktiga rättvisa odds
+            pinnacle_updated = datetime.fromisoformat(pinnacle["last_update"].replace("Z", "+00:00"))
+            if now - pinnacle_updated > MAX_ODDS_AGE:
                 continue
             
             # Steg 3 & 4: Bygg dictionary per marknad
@@ -57,8 +66,10 @@ for sport in sports:
                 if bookmaker["key"] not in MY_BOOKMAKERS:
                     continue
 
-                pinnacle_updated = datetime.fromisoformat(pinnacle["last_update"].replace("Z", "+00:00"))
                 bookmaker_updated = datetime.fromisoformat(bookmaker["last_update"].replace("Z", "+00:00"))
+                if now - bookmaker_updated > MAX_ODDS_AGE:
+                    continue
+
                 skillnad = abs(pinnacle_updated - bookmaker_updated)
                 if skillnad > timedelta(minutes=5):
                     continue
@@ -77,6 +88,8 @@ for sport in sports:
                         if fair and offered_odds > fair:
                             edge = (offered_odds / fair) - 1
                             if edge < 0.025:
+                                continue
+                            if edge > MAX_EDGE:                          # nästan alltid datafel
                                 continue
 
                             # Dubblettspärr: hoppa över om vi redan flaggat detta bet
