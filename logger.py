@@ -37,6 +37,13 @@ def init_db():
             CREATE UNIQUE INDEX IF NOT EXISTS ux_bets_unique
             ON bets (match_id, market_key, outcome_name, COALESCE(point, ''), bookmaker)
         """)
+        # Migrering: databaser skapade före CLV saknar clv_status. Befintliga rader får NULL.
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(bets)")]
+        if "clv_status" not in columns:
+            conn.execute("""
+                ALTER TABLE bets ADD COLUMN clv_status TEXT
+                CHECK (clv_status IN ('ok', 'line_changed', 'missing') OR clv_status IS NULL)
+            """)
 
 
 def log_bet(match, sport_key, market_key, outcome_name, point, bookmaker, offered_odds, fair, edge, units):

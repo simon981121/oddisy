@@ -45,7 +45,7 @@ class TestLogger(unittest.TestCase):
             "id", "logged_date", "match_date", "commence_time", "sport_key", "match_id",
             "match_name", "market_key", "outcome_name", "point", "bookmaker",
             "offered_odds", "fair_at_flag", "edge", "units", "stake_flat", "stake_kelly",
-            "result", "closing_fair", "clv",
+            "result", "closing_fair", "clv", "clv_status",
         ])
 
     def test_h2h_row(self):
