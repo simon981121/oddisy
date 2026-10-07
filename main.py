@@ -2,7 +2,7 @@ print("Startar Oddisy...", flush=True)
 
 from api import get_sports, get_odds
 from calculator import calculate_fair_odds, find_pinnacle
-from logger import init_excel, log_bet
+from logger import init_db, log_bet
 from tracker import load_seen, save_seen, make_key, should_flag, mark_flagged
 from datetime import datetime, timezone, timedelta
 
@@ -15,7 +15,7 @@ MAX_DAYS_AHEAD = 3
 MAX_EDGE = 0.15
 MAX_ODDS_AGE = timedelta(minutes=3)
 
-init_excel()
+init_db()
 seen = load_seen()
 
 sports = get_sports()
@@ -119,6 +119,6 @@ for sport in sports:
                             print(f"Half Kelly: {units}u")
                             print("---")
                             
-                            log_bet(match, outcome['name'] + point_str, bookmaker, offered_odds, fair, edge, units, sport["key"], market["key"])
+                            log_bet(match, sport["key"], market["key"], outcome["name"], point, bookmaker, offered_odds, fair, edge, units)
 
 save_seen(seen)

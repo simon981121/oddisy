@@ -1,67 +1,72 @@
-import os
-from datetime import datetime
-from openpyxl import Workbook, load_workbook
+import sqlite3
+from contextlib import closing
+from datetime import datetime, timezone
 
-FILE = "bets.xlsx"
+DB_FILE = "bets.db"
 
-def init_excel():
-    if not os.path.exists(FILE):
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Bets"
-        ws.append(["Datum loggad", "Matchdatum", "Sport", "Match", "Lag", "Marknad", "Bookmaker", "Odds", "Rättvisa odds", "Edge %", "Units", "Insats Flat (kr)", "Insats Kelly (kr)", "Resultat", "V/F Flat", "V/F Kelly"])
-        ws.column_dimensions['A'].width = 14
-        ws.column_dimensions['B'].width = 12
-        ws.column_dimensions['C'].width = 15
-        ws.column_dimensions['D'].width = 35
-        ws.column_dimensions['E'].width = 20
-        ws.column_dimensions['F'].width = 10  # Marknad
-        ws.column_dimensions['G'].width = 15  # Bookmaker
-        ws.column_dimensions['H'].width = 8   # Odds
-        ws.column_dimensions['I'].width = 14  # Rättvisa odds
-        ws.column_dimensions['J'].width = 8   # Edge %
-        ws.column_dimensions['K'].width = 8   # Units
-        ws.column_dimensions['L'].width = 14  # Insats Flat
-        ws.column_dimensions['M'].width = 14  # Insats Kelly
-        ws.column_dimensions['N'].width = 10  # Resultat
-        ws.column_dimensions['O'].width = 12  # V/F Flat
-        ws.column_dimensions['P'].width = 12  # V/F Kelly
-        ws.column_dimensions['Q'].width = 3   # mellanrum
-        wb.save(FILE)
 
-def log_bet(match, team, bookmaker, offered_odds, fair, edge, units, sport, market_type):
-    match_date = match['commence_time'][:10]
-    logged_date = datetime.now().strftime("%Y-%m-%d")
-    kelly_stake = round(units * 10, 2)
+def init_db():
+    """Skapar tabellen bets och dubblettindexet om de saknas."""
+    with closing(sqlite3.connect(DB_FILE)) as conn, conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bets (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                logged_date   TEXT NOT NULL,
+                match_date    TEXT,
+                commence_time TEXT,
+                sport_key     TEXT,
+                match_id      TEXT NOT NULL,
+                match_name    TEXT,
+                market_key    TEXT NOT NULL,
+                outcome_name  TEXT NOT NULL,
+                point         REAL,
+                bookmaker     TEXT NOT NULL,
+                offered_odds  REAL,
+                fair_at_flag  REAL,
+                edge          REAL,
+                units         REAL,
+                stake_flat    REAL DEFAULT 20,
+                stake_kelly   REAL,
+                result        TEXT CHECK (result IN ('W', 'L', 'P') OR result IS NULL),
+                closing_fair  REAL,
+                clv           REAL
+            )
+        """)
+        # NULL räknas som olika i UNIQUE, därför COALESCE så h2h (point NULL) också spärras
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_bets_unique
+            ON bets (match_id, market_key, outcome_name, COALESCE(point, ''), bookmaker)
+        """)
 
-    wb = load_workbook(FILE)
-    ws = wb.active
 
-    last_row = ws.max_row
-    if last_row > 1:
-        last_date = ws.cell(row=last_row, column=1).value
-        if last_date and str(last_date) != logged_date:
-            ws.append([""])
+def log_bet(match, sport_key, market_key, outcome_name, point, bookmaker, offered_odds, fair, edge, units):
+    """Loggar ett bet. Returnerar True om en ny rad skapades, False om den redan fanns."""
+    point_value = None if point in ("", None) else float(point)
+    logged_date = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-    row = ws.max_row + 1
-
-    ws.append([
-        logged_date,                                      # A
-        match_date,                                       # B
-        sport,                                            # C
-        f"{match['home_team']} vs {match['away_team']}",  # D
-        team,                                             # E: Lag
-        market_type,                                      # F: Marknad (h2h/totals)
-        bookmaker['title'],                               # G: Bookmaker
-        offered_odds,                                     # H: Odds
-        round(fair, 2),                                   # I: Rättvisa odds
-        round(edge * 100, 1),                             # J: Edge %
-        units,                                            # K: Units
-        20,                                               # L: Insats Flat
-        kelly_stake,                                      # M: Insats Kelly
-        "",                                               # N: Resultat
-        f"=IF(UPPER(N{row})=\"W\",(H{row}-1)*L{row},IF(UPPER(N{row})=\"L\",-L{row},\"\"))",  # O: V/F Flat
-        f"=IF(UPPER(N{row})=\"W\",(H{row}-1)*M{row},IF(UPPER(N{row})=\"L\",-M{row},\"\"))",  # P: V/F Kelly
-    ])
-
-    wb.save(FILE)
+    with closing(sqlite3.connect(DB_FILE)) as conn, conn:
+        cursor = conn.execute("""
+            INSERT OR IGNORE INTO bets (
+                logged_date, match_date, commence_time, sport_key, match_id, match_name,
+                market_key, outcome_name, point, bookmaker,
+                offered_odds, fair_at_flag, edge, units, stake_flat, stake_kelly
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            logged_date,
+            match["commence_time"][:10],
+            match["commence_time"],
+            sport_key,
+            match["id"],
+            f"{match['home_team']} vs {match['away_team']}",
+            market_key,
+            outcome_name,
+            point_value,
+            bookmaker["key"],
+            offered_odds,
+            fair,
+            edge,
+            units,
+            20,
+            round(units * 10, 2),
+        ))
+        return cursor.rowcount == 1
