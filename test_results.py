@@ -6,10 +6,14 @@ import tempfile
 import unittest
 from contextlib import closing, redirect_stdout
 from datetime import datetime, timezone
+from unittest import mock
+
+import requests
 
 import logger
 import results
 import set_result
+from test_api import KEY, LEAKY_URL, import_api
 
 NOW = datetime(2026, 10, 7, 12, 0, tzinfo=timezone.utc)
 UNIBET = {"key": "unibet_se", "title": "Unibet"}
@@ -147,6 +151,40 @@ class TestRun(unittest.TestCase):
         summary, out = self.run_results({"message": "Usage quota has been reached"})
         self.assertIsNone(self.result_of("m1"))
         self.assertIn("Varning", out)
+        self.assertIn("Slut på krediter?", out)
+
+    def test_credit_hint_only_for_credit_errors(self):
+        cases = [({"message": "Usage quota has been reached"}, True),
+                 ({"message": "Du har slut", "error_code": "OUT_OF_USAGE_CREDITS"}, True),
+                 ({"message": "nätverksfel (ReadTimeout)"}, False),
+                 ({"message": "ogiltigt svar (HTTP 502)"}, False),
+                 ({"message": "API key is not valid", "error_code": "INVALID_KEY"}, False),
+                 (None, False)]
+        for i, (games, credit) in enumerate(cases):
+            with self.subTest(games=games):
+                self.add(f"m{i}", "2026-10-06T18:00:00Z")
+                _, out = self.run_results(games)
+                self.assertIn("Varning: inga scores", out)
+                self.assertEqual("Slut på krediter?" in out, credit)
+
+    def test_timeout_left_null_with_real_get_scores(self):
+        api = import_api()
+        self.add("m1", "2026-10-06T18:00:00Z")
+        self.add("b1", "2026-10-06T18:00:00Z", sport_key="basketball_nba")
+        errors = [requests.exceptions.ReadTimeout(LEAKY_URL), requests.exceptions.ConnectionError(LEAKY_URL)]
+        with mock.patch.object(api, "API_KEY", KEY), \
+                mock.patch.object(api.requests, "get", side_effect=errors) as get, \
+                redirect_stdout(io.StringIO()) as out:
+            summary = results.run(self.db, api.get_scores, NOW)
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(get.call_args.kwargs["timeout"], (5, 30))
+        self.assertIsNone(self.result_of("m1"))
+        self.assertIsNone(self.result_of("b1"))
+        self.assertEqual(summary["settled"], [])
+        self.assertIn("nätverksfel (ReadTimeout)", out.getvalue())
+        self.assertIn("nätverksfel (ConnectionError)", out.getvalue())
+        self.assertNotIn("Slut på krediter?", out.getvalue())
+        self.assertNotIn(KEY, out.getvalue())
 
     def test_already_settled_not_touched(self):
         self.add("m1", "2026-10-06T18:00:00Z")

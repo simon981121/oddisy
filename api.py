@@ -1,21 +1,46 @@
 import requests
-import os 
+import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
 API_KEY = os.getenv("ODDS_API_KEY")
 BASE_URL = "https://api.the-odds-api.com/v4"
+REQUEST_TIMEOUT = (5, 30)        # sekunder: (anslutning, max väntan mellan datapaket)
+NETWORK_ERROR = "nätverksfel"
 
-def get_odds(sport, regions, markets): 
+
+def is_network_error(data):
+    """True om data är felvärdet från _get för timeout eller anslutningsfel."""
+    return isinstance(data, dict) and str(data.get("message", "")).startswith(NETWORK_ERROR)
+
+
+def _get(url, params):
+    """requests.get med timeout. Returnerar (data, response).
+    Vid nätverksfel eller ogiltigt svar är data {"message": ...}, samma form som API:ts egna fel,
+    och response är None om inget svar kom."""
+    try:
+        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+        # Felmeddelandet kan innehålla URL:en med API-nyckeln, skriv bara ut feltypen
+        return {"message": f"{NETWORK_ERROR} ({type(e).__name__})"}, None
+    except requests.exceptions.RequestException as e:
+        return {"message": f"anropsfel ({type(e).__name__})"}, None
+    try:
+        return response.json(), response
+    except ValueError:
+        return {"message": f"ogiltigt svar (HTTP {response.status_code})"}, response
+
+
+def get_odds(sport, regions, markets):
     url = f"{BASE_URL}/sports/{sport}/odds"
     params = {
         "apiKey": API_KEY,
-        "regions": regions, 
+        "regions": regions,
         "markets": markets,
     }
-    response = requests.get(url, params=params)
-    return response.json()
+    data, _ = _get(url, params)
+    return data
 
 
 def get_scores(sport, days_from=3, event_ids=None):
@@ -26,10 +51,11 @@ def get_scores(sport, days_from=3, event_ids=None):
     }
     if event_ids:
         params["eventIds"] = ",".join(event_ids)
-    response = requests.get(url, params=params)
-    print(f"Scores {sport}: kostnad {response.headers.get('x-requests-last')}, "
-          f"kvar {response.headers.get('x-requests-remaining')}")
-    return response.json()
+    data, response = _get(url, params)
+    if response is not None:
+        print(f"Scores {sport}: kostnad {response.headers.get('x-requests-last')}, "
+              f"kvar {response.headers.get('x-requests-remaining')}")
+    return data
 
 
 def get_pinnacle_odds(sport_key, event_id, market_key):
@@ -42,14 +68,9 @@ def get_pinnacle_odds(sport_key, event_id, market_key):
         "bookmakers": "pinnacle",
         "markets": market_key,
     }
-    try:
-        response = requests.get(url, params=params, timeout=15)
-        data = response.json()
-    except requests.RequestException as e:
-        # Felmeddelandet kan innehålla URL:en med API-nyckeln, skriv bara ut feltypen
-        return {"message": f"nätverksfel ({type(e).__name__})"}, None, None
-    except ValueError:
-        return {"message": f"ogiltigt svar (HTTP {response.status_code})"}, None, None
+    data, response = _get(url, params)
+    if response is None:
+        return data, None, None
     return data, response.headers.get("x-requests-last"), response.headers.get("x-requests-remaining")
 
 
@@ -58,5 +79,5 @@ def get_sports():
     params = {
         "apiKey": API_KEY
     }
-    response = requests.get(url, params=params)
-    return response.json()
+    data, _ = _get(url, params)
+    return data

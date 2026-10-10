@@ -1,17 +1,18 @@
-import importlib
 import io
 import os
 import sqlite3
-import sys
 import tempfile
 import unittest
 from contextlib import closing, redirect_stdout
 from datetime import datetime, timezone
 from unittest import mock
 
+import requests
+
 import clv
 import logger
 from calculator import calculate_fair_odds
+from test_api import KEY, LEAKY_URL, import_api
 
 NOW = datetime(2026, 10, 7, 18, 0, tzinfo=timezone.utc)
 UNIBET = {"key": "unibet_se", "title": "Unibet"}
@@ -379,50 +380,29 @@ class TestRun(DbTestCase):
         self.assertFalse(os.path.exists(missing))
 
 
-class TestGetPinnacleOdds(unittest.TestCase):
-    """api.py importeras med load_dotenv avstängd, så .env aldrig läses. requests.get är mockad."""
+class TestRunWithApi(DbTestCase):
+    """clv.run mot riktiga get_pinnacle_odds med mockad requests.get."""
 
     @classmethod
     def setUpClass(cls):
-        sys.modules.pop("api", None)
-        with mock.patch("dotenv.load_dotenv"):
-            cls.api = importlib.import_module("api")
+        cls.api = import_api()
 
-    @classmethod
-    def tearDownClass(cls):
-        sys.modules.pop("api", None)
-
-    def setUp(self):
-        patcher = mock.patch.object(self.api, "API_KEY", "test-nyckel")
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
-    def test_event_endpoint_pinnacle_only(self):
-        response = mock.Mock(headers={"x-requests-last": "2", "x-requests-remaining": "498"})
-        response.json.return_value = event(H2H)
-        with mock.patch.object(self.api.requests, "get", return_value=response) as get:
-            data, cost, remaining = self.api.get_pinnacle_odds("soccer_x", "ev1", "h2h,totals")
-        url = get.call_args.args[0]
-        params = get.call_args.kwargs["params"]
-        self.assertTrue(url.endswith("/v4/sports/soccer_x/events/ev1/odds"))
-        self.assertEqual(params, {"apiKey": "test-nyckel", "bookmakers": "pinnacle",
-                                  "markets": "h2h,totals"})
-        self.assertEqual((data, cost, remaining), (event(H2H), "2", "498"))
-
-    def test_network_error_hides_key(self):
-        error = self.api.requests.ConnectionError("https://...?apiKey=test-nyckel")
-        with mock.patch.object(self.api.requests, "get", side_effect=error):
-            data, cost, remaining = self.api.get_pinnacle_odds("soccer_x", "ev1", "h2h")
-        self.assertNotIn("test-nyckel", data["message"])
-        self.assertIn("ConnectionError", data["message"])
-        self.assertEqual((cost, remaining), (None, None))
-
-    def test_non_json_response(self):
-        response = mock.Mock(status_code=502, headers={})
-        response.json.side_effect = ValueError("not json")
-        with mock.patch.object(self.api.requests, "get", return_value=response):
-            data, _, _ = self.api.get_pinnacle_odds("soccer_x", "ev1", "h2h")
-        self.assertIn("502", data["message"])
+    def test_timeout_left_null_not_missing(self):
+        bet_id = self.add("m1", "2026-10-07T18:05:00Z")
+        other = self.add("m2", "2026-10-07T18:10:00Z")
+        errors = [requests.exceptions.ReadTimeout(LEAKY_URL), requests.exceptions.ConnectionError(LEAKY_URL)]
+        with mock.patch.object(self.api, "API_KEY", KEY), \
+                mock.patch.object(self.api.requests, "get", side_effect=errors) as get, \
+                redirect_stdout(io.StringIO()) as out:
+            summary = clv.run(self.db, self.api.get_pinnacle_odds, NOW)
+        self.assertEqual(get.call_args.kwargs["timeout"], (5, 30))
+        self.assertEqual(self.row(bet_id), (None, None, None))
+        self.assertEqual(self.row(other), (None, None, None))
+        self.assertEqual(summary["missing"], [])
+        self.assertEqual(summary["retry"], [bet_id, other])
+        self.assertIn("nätverksfel (ReadTimeout)", out.getvalue())
+        self.assertIn("nätverksfel (ConnectionError)", out.getvalue())
+        self.assertNotIn(KEY, out.getvalue())
 
 
 if __name__ == "__main__":

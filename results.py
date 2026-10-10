@@ -66,6 +66,15 @@ def settle(bet, game):
     return None
 
 
+def is_credit_error(data):
+    """True om API:t svarat att krediterna är slut, t.ex.
+    {"message": "Usage quota has been reached", "error_code": "OUT_OF_USAGE_CREDITS"}."""
+    if not isinstance(data, dict):
+        return False
+    return (data.get("error_code") == "OUT_OF_USAGE_CREDITS"
+            or "quota" in str(data.get("message", "")).lower())
+
+
 def describe(bet):
     label = outcome_label(bet["outcome_name"], bet["point"])
     return f"id {bet['id']}: {bet['match_name']} ({bet['sport_key']}, {bet['market_key']} {label})"
@@ -111,7 +120,8 @@ def run(db_file=DB_FILE, fetch=None, now=None):
             summary["fetched"].append(sport_key)
             if not isinstance(games, list):
                 message = games.get("message") if isinstance(games, dict) else games
-                print(f"Varning: inga scores för {sport_key} ({message}). Slut på krediter?")
+                hint = " Slut på krediter?" if is_credit_error(games) else ""
+                print(f"Varning: inga scores för {sport_key} ({message}).{hint}")
                 games = []
             by_id = {g["id"]: g for g in games}
 
