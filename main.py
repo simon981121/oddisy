@@ -12,11 +12,38 @@ from datetime import datetime, timezone, timedelta
 
 
 REGIONS = "eu"
-MARKETS = "h2h,totals"
+MARKETS = "h2h"
+SOCCER_ALLOWLIST = [                 # tom lista = alla soccer_-sporter
+    "soccer_argentina_primera_division", "soccer_sweden_allsvenskan",
+    "soccer_poland_ekstraklasa", "soccer_italy_serie_a", "soccer_germany_liga3",
+    "soccer_germany_bundesliga", "soccer_france_ligue_one", "soccer_sweden_superettan",
+    "soccer_spain_segunda_division", "soccer_japan_j_league", "soccer_germany_bundesliga2",
+    "soccer_china_superleague", "soccer_brazil_serie_b", "soccer_belgium_first_div",
+    "soccer_austria_bundesliga",
+]
+TENNIS_PREFIXES = ("tennis_atp_", "tennis_wta_")
 MY_BOOKMAKERS = ["unibet_se"]
 MAX_DAYS_AHEAD = 3
 MAX_EDGE = 0.15
 MAX_ODDS_AGE = timedelta(minutes=3)
+
+
+def select_sports(sports):
+    """Sporter som ska skannas: aktiva, inte outrights/_winner, och antingen fotboll i
+    SOCCER_ALLOWLIST (alla soccer_ om listan är tom) eller tennis enligt TENNIS_PREFIXES."""
+    selected = []
+    for sport in sports:
+        key = sport["key"]
+        if not sport["active"] or sport.get("has_outrights") or key.endswith("_winner"):
+            continue
+        if SOCCER_ALLOWLIST:
+            is_soccer = key in SOCCER_ALLOWLIST
+        else:
+            is_soccer = key.startswith("soccer_")
+        if is_soccer or key.startswith(TENNIS_PREFIXES):
+            selected.append(sport)
+    return selected
+
 
 def error_location(e):
     """Fil och rad där undantaget uppstod, t.ex. "main.py:42". Felets text tas aldrig med."""
@@ -132,7 +159,7 @@ def scan_sport(sport, seen):
 
 
 def run():
-    """Skannar alla aktiva sporter. Returnerar antal per utfall: ok, network, api, unexpected."""
+    """Skannar sporterna som select_sports väljer. Returnerar antal per utfall: ok, network, api, unexpected."""
     init_db()
     seen = load_seen()
     counts = {"ok": 0, "network": 0, "api": 0, "unexpected": 0}
@@ -142,9 +169,14 @@ def run():
             message = sports.get("message") if isinstance(sports, dict) else sports
             print(f"Varning: kunde inte hämta sporter, {message}", flush=True)
             sports = []
-        for sport in sports:
-            if not sport["active"]:
-                continue
+        selected = select_sports(sports)
+        skipped = len(sports) - len(selected)
+        soccer = sum(1 for s in selected if s["key"].startswith("soccer_"))
+        markets = len(MARKETS.split(","))
+        print(f"Valda sporter: {len(selected)} ({soccer} fotboll, {len(selected) - soccer} tennis). "
+              f"Beräknad kostnad: {len(selected)} × {markets} marknad(er) × 1 region = "
+              f"{len(selected) * markets} krediter.", flush=True)
+        for sport in selected:
             try:
                 counts[scan_sport(sport, seen)] += 1
             except Exception as e:
@@ -154,7 +186,7 @@ def run():
                       flush=True)
         print(f"\nSammanfattning: {counts['ok']} sporter skannade, hoppade över "
               f"{counts['network']} pga nätverksfel, {counts['unexpected']} pga oväntade fel, "
-              f"{counts['api']} pga andra API-fel.", flush=True)
+              f"{counts['api']} pga andra API-fel. {skipped} sporter bortvalda.", flush=True)
     finally:
         save_seen(seen)
     return counts
