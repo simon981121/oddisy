@@ -10,6 +10,7 @@ from unittest import mock
 
 import requests
 
+import credits
 import logger
 import results
 import set_result
@@ -185,6 +186,57 @@ class TestRun(unittest.TestCase):
         self.assertIn("nätverksfel (ConnectionError)", out.getvalue())
         self.assertNotIn("Slut på krediter?", out.getvalue())
         self.assertNotIn(KEY, out.getvalue())
+
+    def credit_rows(self):
+        with closing(sqlite3.connect(self.db)) as conn:
+            return conn.execute("SELECT script, cost, remaining FROM credit_log ORDER BY id").fetchall()
+
+    def test_usage_logged_per_fetch(self):
+        self.add("a1", "2026-10-06T18:00:00Z")
+        self.add("b1", "2026-10-06T18:00:00Z", sport_key="basketball_nba")
+        usages = iter([(2, 100), (None, None)])           # andra anropet utan headrar loggas inte
+        with redirect_stdout(io.StringIO()):
+            results.run(self.db, self.fake_fetch([]), NOW, usage=lambda: next(usages))
+        self.assertEqual(self.credit_rows(), [("results", 2, 100)])
+
+    def test_low_remaining_blocks_without_calls(self):
+        self.add("m1", "2026-10-06T18:00:00Z")
+        credits.log_usage("main", 1, 29, self.db)
+        with redirect_stdout(io.StringIO()), self.assertRaises(credits.BudgetError) as ctx:
+            results.run(self.db, self.fake_fetch([game(2, 1, game_id="m1")]), NOW)
+        self.assertEqual(self.calls, [])
+        self.assertIsNone(self.result_of("m1"))
+        self.assertIn("Kreditskydd (reserv)", str(ctx.exception))
+        self.assertIn("Byt nyckel i .env", str(ctx.exception))
+
+    def test_nothing_to_fetch_not_blocked(self):
+        credits.log_usage("main", 1, 0, self.db)
+        summary, _ = self.run_results([])
+        self.assertEqual(self.calls, [])
+
+    def test_creates_credit_log_in_old_db(self):
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("DROP TABLE credit_log")
+        self.add("m1", "2026-10-06T18:00:00Z")
+        self.run_results([game(2, 1, game_id="m1")])
+        self.assertEqual(self.credit_rows(), [])
+        self.assertEqual(self.result_of("m1"), "W")
+
+    def test_real_get_scores_logs_headers_without_key(self):
+        api = import_api()
+        self.add("m1", "2026-10-06T18:00:00Z")
+        r = mock.Mock(status_code=200, headers={"x-requests-last": "2", "x-requests-remaining": "77"})
+        r.json.return_value = [game(2, 1, game_id="m1")]
+        with mock.patch.dict(sys.modules, {"api": api}), \
+                mock.patch.object(api, "API_KEY", KEY), \
+                mock.patch.object(api.requests, "get", return_value=r), \
+                redirect_stdout(io.StringIO()) as out:
+            results.run(self.db, now=NOW)             # fetch saknas: run importerar api själv
+        self.assertEqual(self.result_of("m1"), "W")
+        self.assertEqual(self.credit_rows(), [("results", 2, 77)])
+        self.assertNotIn(KEY, out.getvalue())
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertNotIn(KEY, "\n".join(conn.iterdump()))
 
     def test_already_settled_not_touched(self):
         self.add("m1", "2026-10-06T18:00:00Z")

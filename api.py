@@ -8,6 +8,7 @@ API_KEY = os.getenv("ODDS_API_KEY")
 BASE_URL = "https://api.the-odds-api.com/v4"
 REQUEST_TIMEOUT = (5, 30)        # sekunder: (anslutning, max väntan mellan datapaket)
 NETWORK_ERROR = "nätverksfel"
+last_usage = (None, None)        # (kostnad, kvarvarande krediter) från senaste anropets headrar
 
 
 def is_network_error(data):
@@ -15,10 +16,28 @@ def is_network_error(data):
     return isinstance(data, dict) and str(data.get("message", "")).startswith(NETWORK_ERROR)
 
 
+def _header_int(headers, name):
+    try:
+        return int(float(headers.get(name)))
+    except (TypeError, ValueError):
+        return None
+
+
+def usage(response):
+    """(kostnad, kvarvarande krediter) som int från x-requests-last och x-requests-remaining.
+    En header som saknas eller är ogiltig blir None."""
+    if response is None:
+        return None, None
+    headers = response.headers or {}
+    return _header_int(headers, "x-requests-last"), _header_int(headers, "x-requests-remaining")
+
+
 def _get(url, params):
     """requests.get med timeout. Returnerar (data, response).
     Vid nätverksfel eller ogiltigt svar är data {"message": ...}, samma form som API:ts egna fel,
-    och response är None om inget svar kom."""
+    och response är None om inget svar kom. Sätter last_usage från svarets headrar."""
+    global last_usage
+    last_usage = (None, None)    # aldrig ett gammalt värde efter ett nätverksfel
     try:
         response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
     except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
@@ -26,6 +45,7 @@ def _get(url, params):
         return {"message": f"{NETWORK_ERROR} ({type(e).__name__})"}, None
     except requests.exceptions.RequestException as e:
         return {"message": f"anropsfel ({type(e).__name__})"}, None
+    last_usage = usage(response)
     try:
         return response.json(), response
     except ValueError:

@@ -6,7 +6,7 @@ DB_FILE = "bets.db"
 
 
 def init_db(db_file=None):
-    """Skapar tabellen bets och dubblettindexet om de saknas."""
+    """Skapar tabellerna bets och credit_log samt dubblettindexet om de saknas."""
     with closing(sqlite3.connect(db_file or DB_FILE)) as conn, conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS bets (
@@ -44,6 +44,16 @@ def init_db(db_file=None):
                 ALTER TABLE bets ADD COLUMN clv_status TEXT
                 CHECK (clv_status IN ('ok', 'line_changed', 'missing') OR clv_status IS NULL)
             """)
+        # Kreditförbrukning per API-anrop, se credits.py. script='reset' markerar nyckelbyte.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS credit_log (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts        TEXT NOT NULL,
+                script    TEXT NOT NULL CHECK (script IN ('main', 'clv', 'results', 'reset')),
+                cost      INTEGER,
+                remaining INTEGER
+            )
+        """)
 
 
 def log_bet(match, sport_key, market_key, outcome_name, point, bookmaker, offered_odds, fair, edge, units):

@@ -4,7 +4,9 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from credits import BudgetError, check_budget, log_usage
 from export_excel import outcome_label
+from logger import init_db
 
 DB_FILE = "bets.db"
 MIN_AGE = timedelta(hours=3)          # matchen ska ha startat minst så här länge sedan
@@ -93,12 +95,15 @@ def load_open_bets(conn, now):
     return [b for b in rows if now - parse_time(b["commence_time"]) >= MIN_AGE]
 
 
-def run(db_file=DB_FILE, fetch=None, now=None):
-    """Avgör öppna bets. fetch(sport_key, days_from, event_ids) ska returnera scores-listan."""
+def run(db_file=DB_FILE, fetch=None, now=None, usage=None):
+    """Avgör öppna bets. fetch(sport_key, days_from, event_ids) ska returnera scores-listan.
+    usage() ska returnera (kostnad, kvarvarande krediter) för senaste fetch, eller saknas.
+    Kastar BudgetError före första anropet om kreditskyddet slår till."""
     now = now or datetime.now(timezone.utc)
     summary = {"settled": [], "manual": [], "unclear": [], "fetched": []}
 
     with closing(open_db(db_file)) as conn:
+        init_db(db_file)                  # skapar credit_log i äldre databaser
         bets = load_open_bets(conn, now)
         manual = [b for b in bets if is_manual(b)]
         by_sport = {}
@@ -110,13 +115,18 @@ def run(db_file=DB_FILE, fetch=None, now=None):
               f"Hämtar scores för {len(by_sport)} sporter, beräknad kostnad "
               f"{len(by_sport) * CREDITS_PER_SPORT} krediter.")
 
+        if by_sport:
+            check_budget("results", len(by_sport) * CREDITS_PER_SPORT, db_file)
         if by_sport and fetch is None:
-            from api import get_scores    # importeras först här, så tester aldrig rör API:t
-            fetch = get_scores
+            import api                    # importeras först här, så tester aldrig rör API:t
+            fetch = api.get_scores
+            usage = lambda: api.last_usage
 
         for sport_key, sport_bets in by_sport.items():
             event_ids = sorted({b["match_id"] for b in sport_bets})
             games = fetch(sport_key, DAYS_FROM, event_ids)
+            if usage:
+                log_usage("results", *usage(), db_file)
             summary["fetched"].append(sport_key)
             if not isinstance(games, list):
                 message = games.get("message") if isinstance(games, dict) else games
@@ -158,3 +168,6 @@ if __name__ == "__main__":
     except FileNotFoundError as e:
         print(f"Fel: {e}", file=sys.stderr)
         sys.exit(1)
+    except BudgetError as e:
+        print(f"Avbryter: {e}", file=sys.stderr)
+        sys.exit(2)

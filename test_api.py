@@ -117,6 +117,35 @@ class TestAllFunctions(ApiTestCase):
                 self.assertEqual(data_of(name, result), {"message": "ogiltigt svar (HTTP 502)"})
 
 
+class TestLastUsage(ApiTestCase):
+    def test_set_from_headers_for_all_functions(self):
+        headers = {"x-requests-last": "2", "x-requests-remaining": "498"}
+        for name in CALLS:
+            with self.subTest(name):
+                self.call(name, return_value=response([], headers=headers))
+                self.assertEqual(self.api.last_usage, (2, 498))
+
+    def test_http_error_with_headers(self):
+        headers = {"x-requests-last": "0", "x-requests-remaining": "0"}
+        self.call("get_odds", return_value=response({"message": "Usage quota has been reached"},
+                                                    status=429, headers=headers))
+        self.assertEqual(self.api.last_usage, (0, 0))
+
+    def test_reset_on_network_error(self):
+        self.call("get_odds", return_value=response([], headers={"x-requests-last": "1",
+                                                                 "x-requests-remaining": "9"}))
+        self.call("get_odds", side_effect=requests.exceptions.ReadTimeout(LEAKY_URL))
+        self.assertEqual(self.api.last_usage, (None, None))
+
+    def test_missing_or_invalid_headers(self):
+        self.call("get_sports", return_value=response([]))
+        self.assertEqual(self.api.last_usage, (None, None))
+        self.call("get_sports", return_value=response([], headers={"x-requests-last": "x",
+                                                                   "x-requests-remaining": "12"}))
+        self.assertEqual(self.api.last_usage, (None, 12))
+        self.assertEqual(self.api.usage(None), (None, None))
+
+
 class TestGetScores(ApiTestCase):
     def test_cost_printed(self):
         headers = {"x-requests-last": "2", "x-requests-remaining": "498"}

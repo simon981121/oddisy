@@ -1,10 +1,13 @@
 print("Startar Oddisy...", flush=True)
 
 import os
+import sys
 import traceback
 
+import api
 from api import get_sports, get_odds, is_network_error
 from calculator import calculate_fair_odds, find_pinnacle
+from credits import BudgetError, check_budget, log_usage
 from logger import init_db, log_bet
 from tracker import load_seen, save_seen, make_key, should_flag, mark_flagged
 from datetime import datetime, timezone, timedelta
@@ -55,6 +58,7 @@ def scan_sport(sport, seen):
     """Jämför alla matcher i en sport och loggar value bets.
     Returnerar "ok", "network" (nätverksfel) eller "api" (annat API-fel)."""
     odds = get_odds(sport["key"], REGIONS, MARKETS)
+    log_usage("main", *api.last_usage)
     if not isinstance(odds, list):
         # API- eller nätverksfel, t.ex. {"message": "nätverksfel (ReadTimeout)"}
         message = odds.get("message") if isinstance(odds, dict) else odds
@@ -159,12 +163,14 @@ def scan_sport(sport, seen):
 
 
 def run():
-    """Skannar sporterna som select_sports väljer. Returnerar antal per utfall: ok, network, api, unexpected."""
+    """Skannar sporterna som select_sports väljer. Returnerar antal per utfall: ok, network, api, unexpected.
+    Kastar BudgetError före första get_odds om kreditskyddet slår till."""
     init_db()
     seen = load_seen()
     counts = {"ok": 0, "network": 0, "api": 0, "unexpected": 0}
     try:
         sports = get_sports()
+        log_usage("main", *api.last_usage)
         if not isinstance(sports, list):
             message = sports.get("message") if isinstance(sports, dict) else sports
             print(f"Varning: kunde inte hämta sporter, {message}", flush=True)
@@ -176,6 +182,7 @@ def run():
         print(f"Valda sporter: {len(selected)} ({soccer} fotboll, {len(selected) - soccer} tennis). "
               f"Beräknad kostnad: {len(selected)} × {markets} marknad(er) × 1 region = "
               f"{len(selected) * markets} krediter.", flush=True)
+        check_budget("main", len(selected) * markets)
         for sport in selected:
             try:
                 counts[scan_sport(sport, seen)] += 1
@@ -193,4 +200,8 @@ def run():
 
 
 if __name__ == "__main__":
-    run()
+    try:
+        run()
+    except BudgetError as e:
+        print(f"Avbryter: {e}", file=sys.stderr)
+        sys.exit(2)

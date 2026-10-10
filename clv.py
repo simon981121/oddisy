@@ -5,11 +5,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from calculator import calculate_fair_odds, find_pinnacle
+from credits import BudgetError, check_budget, log_usage
 from logger import init_db
 from results import describe
 
 DB_FILE = "bets.db"
-WINDOW = timedelta(minutes=15)                 # bets vars match startar inom så här lång tid
+WINDOW = timedelta(minutes=8)                  # bets vars match startar inom så här lång tid
 STATUSES = ("ok", "line_changed", "missing")
 CREDITS_PER_MARKET = 1                         # event-odds: marknader i svaret x 1 region (bookmakers=pinnacle)
 
@@ -80,7 +81,8 @@ def pinnacle_markets(data):
 
 def run(db_file=DB_FILE, fetch=None, now=None):
     """Mäter CLV för bets vars match startar inom WINDOW.
-    fetch(sport_key, event_id, market_key) ska returnera (data, kostnad, kvarvarande krediter)."""
+    fetch(sport_key, event_id, market_key) ska returnera (data, kostnad, kvarvarande krediter).
+    Kastar BudgetError före första anropet om kreditskyddet slår till."""
     if not Path(db_file).exists():
         raise FileNotFoundError(f"Hittar inte {db_file} – har något bet loggats än?")
     init_db(db_file)                              # lägger till clv_status i äldre databaser
@@ -100,6 +102,8 @@ def run(db_file=DB_FILE, fetch=None, now=None):
         print(f"{len(bets)} bets startar inom {WINDOW.seconds // 60} min. Hämtar Pinnacle för "
               f"{len(by_match)} matcher, beräknad kostnad högst {estimate} krediter.")
 
+        if by_match:
+            check_budget("clv", estimate, db_file)
         if by_match and fetch is None:
             from api import get_pinnacle_odds     # importeras först här, så tester aldrig rör API:t
             fetch = get_pinnacle_odds
@@ -108,6 +112,7 @@ def run(db_file=DB_FILE, fetch=None, now=None):
             first = match_bets[0]
             market_key = ",".join(sorted({b["market_key"] for b in match_bets}))
             data, cost, remaining = fetch(first["sport_key"], match_id, market_key)
+            log_usage("clv", cost, remaining, db_file)
             print(f"{first['match_name']} ({market_key}): kostnad {cost or '?'}, kvar {remaining or '?'}")
 
             markets = pinnacle_markets(data)
@@ -146,3 +151,6 @@ if __name__ == "__main__":
     except FileNotFoundError as e:
         print(f"Fel: {e}", file=sys.stderr)
         sys.exit(1)
+    except BudgetError as e:
+        print(f"Avbryter: {e}", file=sys.stderr)
+        sys.exit(2)

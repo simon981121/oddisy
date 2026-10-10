@@ -8,6 +8,8 @@ Python-verktyg som jämför Unibet (SE) mot Pinnacles vig-borttagna odds och fla
 - calculator.py: calculate_fair_odds (vig-borttagning), find_pinnacle
 - logger.py: skriver bets till bets.xlsx via openpyxl
 - tracker.py: dubblettspärr, minne i seen_bets.json
+- credits.py: kreditlogg (tabell credit_log i bets.db), veckobudget och reserv (check_budget), "python3 credits.py reset" efter nyckelbyte
+- status.py: förbrukning senaste 7 dagarna per skript, senast kända remaining, öppna bets, missade CLV-fönster
 
 ## Regler och lärdomar
 - Jämför bara marknader med lika många utfall (Pinnacle ishockey-h2h är tvåvägs, Unibet trevägs, vilket gav falska träffar).

@@ -1,14 +1,21 @@
 import importlib
 import io
+import os
+import sqlite3
 import sys
+import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import requests
 
+import credits
+import logger
 from test_api import KEY, LEAKY_URL, non_json_response, response
+
+USAGE_HEADERS = {"x-requests-last": "1", "x-requests-remaining": "400"}
 
 
 def iso(dt):
@@ -58,6 +65,13 @@ class TestMainLoop(unittest.TestCase):
             sys.modules.pop(name, None)
 
     def setUp(self):
+        # check_budget och log_usage använder logger.DB_FILE, så peka om den till en temporär databas
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        db_patcher = mock.patch.object(logger, "DB_FILE", os.path.join(self.tmp.name, "test_bets.db"))
+        db_patcher.start()
+        self.addCleanup(db_patcher.stop)
+        logger.init_db()
         self.seen = {}
         for target, kwargs in [(self.api, {"API_KEY": KEY}),
                                (self.main, {"init_db": mock.Mock(),
@@ -81,6 +95,10 @@ class TestMainLoop(unittest.TestCase):
                 redirect_stdout(io.StringIO()) as out:
             self.counts = self.main.run()
         return out.getvalue(), get
+
+    def credit_rows(self):
+        with closing(sqlite3.connect(logger.DB_FILE)) as conn:
+            return conn.execute("SELECT script, cost, remaining FROM credit_log ORDER BY id").fetchall()
 
     def test_failing_sports_skipped_and_loop_continues(self):
         out, get = self.run_main({
@@ -152,6 +170,67 @@ class TestMainLoop(unittest.TestCase):
         self.assertLess(out.index("Valda sporter"), out.index("Sammanfattning"))
         self.assertIn("1 sporter skannade", out)
         self.assertIn("3 sporter bortvalda.", out)
+
+    def test_usage_logged_per_call_with_headers(self):
+        out, _ = self.run_main({
+            "/sports": response([sport(A), sport(B), sport(C)],
+                                headers={"x-requests-last": "0", "x-requests-remaining": "410"}),
+            f"/sports/{A}/odds": response([], headers={"x-requests-last": "1", "x-requests-remaining": "409"}),
+            f"/sports/{B}/odds": requests.exceptions.ReadTimeout(LEAKY_URL),     # inga headrar
+            f"/sports/{C}/odds": response({"message": "Usage quota has been reached"}, status=429,
+                                          headers={"x-requests-last": "0", "x-requests-remaining": "0"}),
+        })
+        self.assertEqual(self.credit_rows(), [("main", 0, 410), ("main", 1, 409), ("main", 0, 0)])
+        self.assertNotIn(KEY, out)
+        with closing(sqlite3.connect(logger.DB_FILE)) as conn:
+            dump = "\n".join(conn.iterdump())
+        self.assertNotIn(KEY, dump)
+
+    def test_no_headers_nothing_logged(self):
+        self.run_main({"/sports": response([sport(A)]), f"/sports/{A}/odds": response([])})
+        self.assertEqual(self.credit_rows(), [])
+
+    def run_blocked(self):
+        """main.run där /sports svarar med två sporter (kostnad 2). Returnerar (anropade sökvägar, fel, utskrift)."""
+        calls = []
+        def fake_get(url, params=None, timeout=None):
+            calls.append(url.rsplit("/v4", 1)[1])
+            return response([sport(A), sport(B)] if url.endswith("/sports") else [])
+        with mock.patch.object(self.api.requests, "get", side_effect=fake_get), \
+                redirect_stdout(io.StringIO()) as out, \
+                self.assertRaises(credits.BudgetError) as ctx:
+            self.main.run()
+        return calls, str(ctx.exception), out.getvalue()
+
+    def test_weekly_budget_blocks_before_get_odds(self):
+        credits.log_usage("main", 499, None)              # 499 + 2 > 500
+        calls, message, out = self.run_blocked()
+        self.assertEqual(calls, ["/sports"])
+        self.assertIn("Kreditskydd (veckobudget)", message)
+        self.assertIn("Att byta nyckel i .env hjälper inte", message)
+        self.assertNotIn(KEY, out + message)
+        self.main.save_seen.assert_called_once_with(self.seen)
+
+    def test_weekly_budget_counts_only_main(self):
+        credits.log_usage("clv", 499, None)
+        credits.log_usage("results", 499, None)
+        _, get = self.run_main({"/sports": response([sport(A)]), f"/sports/{A}/odds": response([])})
+        self.assertEqual(get.call_count, 2)
+
+    def test_reserve_blocks_before_get_odds(self):
+        credits.log_usage("clv", 1, 31)                   # 31 - 2 < 30
+        calls, message, out = self.run_blocked()
+        self.assertEqual(calls, ["/sports"])
+        self.assertIn("Kreditskydd (reserv)", message)
+        self.assertIn("Byt nyckel i .env", message)
+        self.assertNotIn(KEY, out + message)
+        self.main.save_seen.assert_called_once_with(self.seen)
+
+    def test_unknown_remaining_allows_run(self):
+        credits.log_usage("main", 1, 5)
+        credits.reset()
+        _, get = self.run_main({"/sports": response([sport(A)]), f"/sports/{A}/odds": response([])})
+        self.assertEqual(get.call_count, 2)
 
 
 class TestSelectSports(unittest.TestCase):

@@ -10,6 +10,7 @@ from unittest import mock
 import requests
 
 import clv
+import credits
 import logger
 from calculator import calculate_fair_odds
 from test_api import KEY, LEAKY_URL, import_api
@@ -122,12 +123,15 @@ class DbTestCase(unittest.TestCase):
 
 
 class TestSelectBets(DbTestCase):
+    def test_window_is_8_minutes(self):
+        self.assertEqual(clv.WINDOW.total_seconds(), 8 * 60)
+
     def test_only_window(self):
         self.add("started", "2026-10-07T17:59:00Z")       # startade för 1 min sedan
         at_now = self.add("now", "2026-10-07T18:00:00Z")
-        inside = self.add("inside", "2026-10-07T18:10:00Z")
-        edge = self.add("edge", "2026-10-07T18:15:00Z")
-        self.add("late", "2026-10-07T18:16:00Z")          # 16 min framåt
+        inside = self.add("inside", "2026-10-07T18:05:00Z")
+        edge = self.add("edge", "2026-10-07T18:08:00Z")
+        self.add("late", "2026-10-07T18:09:00Z")          # 9 min framåt, utanför fönstret på 8 min
         self.add("tomorrow", "2026-10-08T18:05:00Z")
         ids = [b["id"] for b in clv.select_bets(self.conn, NOW)]
         self.assertEqual(ids, [at_now, inside, edge])
@@ -274,12 +278,12 @@ class TestRun(DbTestCase):
         self.add("m1", "2026-10-07T18:05:00Z")
         self.add("m1", "2026-10-07T18:05:00Z", market_key="totals", outcome="Over", point=2.5)
         self.add("m1", "2026-10-07T18:05:00Z", outcome="Borta")
-        self.add("m2", "2026-10-07T18:10:00Z")
+        self.add("m2", "2026-10-07T18:07:00Z")
         market = event(H2H, totals((2.5, 1.95, 1.95)))
         _, out = self.run_clv({"m1": market, "m2": event(H2H)})
         self.assertEqual(self.calls, [("soccer_sweden_allsvenskan", "m1", "h2h,totals"),
                                       ("soccer_sweden_allsvenskan", "m2", "h2h")])
-        self.assertIn("4 bets startar inom 15 min", out)
+        self.assertIn("4 bets startar inom 8 min", out)
         self.assertIn("beräknad kostnad högst 3 krediter", out)
         self.assertIn("kostnad 2, kvar 498", out)
         self.assertIn("kostnad 1, kvar 497", out)
@@ -379,6 +383,51 @@ class TestRun(DbTestCase):
             clv.run(missing, self.fake_fetch({}), NOW)
         self.assertFalse(os.path.exists(missing))
 
+    def credit_rows(self):
+        return self.conn.execute("SELECT script, cost, remaining FROM credit_log ORDER BY id").fetchall()
+
+    def test_usage_logged_per_fetch(self):
+        self.add("m1", "2026-10-07T18:05:00Z")
+        self.add("m1", "2026-10-07T18:05:00Z", market_key="totals", outcome="Over", point=2.5)
+        self.add("m2", "2026-10-07T18:07:00Z")
+        self.run_clv({"m1": event(H2H), "m2": event(H2H)})
+        self.assertEqual(self.credit_rows(), [("clv", 2, 498), ("clv", 1, 497)])
+
+    def test_api_error_without_headers_not_logged(self):
+        self.add("m1", "2026-10-07T18:05:00Z")
+        with redirect_stdout(io.StringIO()):
+            clv.run(self.db, lambda *a: ({"message": "nätverksfel (Timeout)"}, None, None), NOW)
+        self.assertEqual(self.credit_rows(), [])
+
+    def test_low_remaining_blocks_without_calls(self):
+        bet_id = self.add("m1", "2026-10-07T18:05:00Z")
+        credits.log_usage("main", 1, 29, self.db)
+        with redirect_stdout(io.StringIO()), self.assertRaises(credits.BudgetError) as ctx:
+            clv.run(self.db, self.fake_fetch({}), NOW)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.row(bet_id), (None, None, None))
+        self.assertIn("Kreditskydd (reserv)", str(ctx.exception))
+        self.assertIn("Byt nyckel i .env", str(ctx.exception))
+
+    def test_remaining_at_reserve_allowed(self):
+        self.add("m1", "2026-10-07T18:05:00Z")
+        credits.log_usage("main", 1, 30, self.db)        # clv blockeras bara om remaining < 30
+        self.run_clv({"m1": event(H2H)})
+        self.assertEqual(len(self.calls), 1)
+
+    def test_empty_window_not_blocked(self):
+        credits.log_usage("main", 1, 0, self.db)
+        summary, _ = self.run_clv({})
+        self.assertEqual(self.calls, [])
+        self.assertEqual(summary["retry"], [])
+
+    def test_weekly_budget_does_not_apply_to_clv(self):
+        self.add("m1", "2026-10-07T18:05:00Z")
+        credits.log_usage("clv", 600, None, self.db, now=NOW)
+        credits.log_usage("main", 600, None, self.db, now=NOW)
+        self.run_clv({"m1": event(H2H)})
+        self.assertEqual(len(self.calls), 1)
+
 
 class TestRunWithApi(DbTestCase):
     """clv.run mot riktiga get_pinnacle_odds med mockad requests.get."""
@@ -389,7 +438,7 @@ class TestRunWithApi(DbTestCase):
 
     def test_timeout_left_null_not_missing(self):
         bet_id = self.add("m1", "2026-10-07T18:05:00Z")
-        other = self.add("m2", "2026-10-07T18:10:00Z")
+        other = self.add("m2", "2026-10-07T18:07:00Z")
         errors = [requests.exceptions.ReadTimeout(LEAKY_URL), requests.exceptions.ConnectionError(LEAKY_URL)]
         with mock.patch.object(self.api, "API_KEY", KEY), \
                 mock.patch.object(self.api.requests, "get", side_effect=errors) as get, \
@@ -403,6 +452,21 @@ class TestRunWithApi(DbTestCase):
         self.assertIn("nätverksfel (ReadTimeout)", out.getvalue())
         self.assertIn("nätverksfel (ConnectionError)", out.getvalue())
         self.assertNotIn(KEY, out.getvalue())
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM credit_log").fetchone()[0], 0)
+
+    def test_headers_logged_without_key(self):
+        self.add("m1", "2026-10-07T18:05:00Z")
+        r = mock.Mock(status_code=200, headers={"x-requests-last": "1", "x-requests-remaining": "321"})
+        r.json.return_value = event(H2H)
+        with mock.patch.object(self.api, "API_KEY", KEY), \
+                mock.patch.object(self.api.requests, "get", return_value=r), \
+                redirect_stdout(io.StringIO()) as out:
+            clv.run(self.db, self.api.get_pinnacle_odds, NOW)
+        self.assertIn("kostnad 1, kvar 321", out.getvalue())
+        self.assertNotIn(KEY, out.getvalue())
+        self.assertEqual(self.conn.execute("SELECT script, cost, remaining FROM credit_log").fetchall(),
+                         [("clv", 1, 321)])
+        self.assertNotIn(KEY, "\n".join(self.conn.iterdump()))
 
 
 if __name__ == "__main__":

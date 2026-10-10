@@ -48,6 +48,24 @@ class TestLogger(unittest.TestCase):
             "result", "closing_fair", "clv", "clv_status",
         ])
 
+    def test_credit_log_table(self):
+        logger.init_db()
+        with closing(sqlite3.connect(logger.DB_FILE)) as conn:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(credit_log)")]
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute("INSERT INTO credit_log (ts, script) VALUES ('x', 'annat')")
+        self.assertEqual(cols, ["id", "ts", "script", "cost", "remaining"])
+
+    def test_init_db_keeps_existing_bets(self):
+        self.log()
+        self.log(market_key="totals", outcome="Over", point=2.5)
+        before = [tuple(r) for r in self.rows()]
+        with closing(sqlite3.connect(logger.DB_FILE)) as conn, conn:
+            conn.execute("DROP TABLE credit_log")         # som en databas från före credit_log
+        logger.init_db()
+        logger.init_db()
+        self.assertEqual([tuple(r) for r in self.rows()], before)
+
     def test_h2h_row(self):
         self.assertTrue(self.log())
         row = self.rows()[0]
